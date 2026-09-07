@@ -1,4 +1,4 @@
-﻿// Evernote2Onenote - imports Evernote notes to Onenote
+// Evernote2Onenote - imports Evernote notes to Onenote
 // Copyright (C) 2014, 2023 - Stefan Kueng
 
 // This program is free software: you can redistribute it and/or modify
@@ -44,7 +44,17 @@ namespace Evernote2Onenote
         private Microsoft.Office.Interop.OneNote.Application _onApp;
         private readonly string _xmlNewOutlineContent =
             "<one:Meta name=\"{2}\" content=\"{1}\"/>" +
-            "<one:OEChildren><one:HTMLBlock><one:Data><![CDATA[{0}]]></one:Data></one:HTMLBlock>{3}</one:OEChildren>";
+            "<one:OEChildren>{0}{3}</one:OEChildren>";
+
+        // Set to false to get the old behaviour back: all attachments are placed
+        // above the note body as page level objects.
+        private const bool InlineAttachments = true;
+
+        private const string XmlHtmlBlock = "<one:HTMLBlock><one:Data><![CDATA[{0}]]></one:Data></one:HTMLBlock>";
+        private const string XmlInlineFile = "<one:OE><one:InsertedFile pathSource=\"{0}\" preferredName=\"{1}\" /></one:OE>";
+        private const string XmlPageFile = "<one:InsertedFile pathSource=\"{0}\" preferredName=\"{1}\" />";
+        private const string AttachTokenPrefix = "@@E2OATTACH";
+        private const string AttachTokenSuffix = "@@";
 
         private const string XmlSourceUrl = "<one:OE alignment=\"left\" quickStyleIndex=\"2\"><one:T><![CDATA[From &lt;<a href=\"{0}\">{0}</a>&gt; ]]></one:T></one:OE>";
 
@@ -565,6 +575,7 @@ namespace Evernote2Onenote
 
                             var tempfiles = new List<string>();
                             var xmlAttachments = "";
+                            var inlineFiles = new List<string>();
                             foreach (var attachment in note.Attachments)
                             {
                                 // save the attached file
@@ -593,16 +604,37 @@ namespace Evernote2Onenote
                                     }
                                     else
                                     {
-                                        if (!string.IsNullOrEmpty(attachment.FileName))
+                                        var preferredName = !string.IsNullOrEmpty(attachment.FileName)
+                                            ? attachment.FileName
+                                            : attachment.Hash;
+
+                                        // do not attach proxy.php image files: those are overlay images created by evernote to search text in images
+                                        var isProxyImage = !string.IsNullOrEmpty(attachment.FileName)
+                                            && attachment.ContentType != null
+                                            && attachment.ContentType.Contains("image")
+                                            && attachment.FileName == "proxy.php";
+
+                                        if (!isProxyImage)
                                         {
-                                            // do not attach proxy.php image files: those are overlay images created by evernote to search text in images
-                                            if (!attachment.ContentType.Contains("image") || attachment.FileName != "proxy.php")
-                                                xmlAttachments +=
-                                                    $"<one:InsertedFile pathSource=\"{tempfilepath}\" preferredName=\"{attachment.FileName}\" />";
+                                            // Try to keep the attachment where it was inside the note:
+                                            // replace the <en-media/> tag with a token. The body is split
+                                            // on those tokens later, so the file ends up between the
+                                            // surrounding text instead of above the whole note.
+                                            var rxAny = new Regex(@"<en-media\b[^>]*?hash=""" + attachment.Hash + @"""[^>]*?(?:/>|></en-media>)", RegexOptions.IgnoreCase);
+                                            if (InlineAttachments && rxAny.IsMatch(htmlBody))
+                                            {
+                                                var token = AttachTokenPrefix + inlineFiles.Count + AttachTokenSuffix;
+                                                inlineFiles.Add(string.Format(XmlInlineFile, tempfilepath, preferredName));
+                                                htmlBody = rxAny.Replace(htmlBody, token, 1);
+                                                // the same resource can be referenced more than once,
+                                                // drop the remaining tags so no stray markup is left
+                                                htmlBody = rxAny.Replace(htmlBody, string.Empty);
+                                            }
+                                            else
+                                            {
+                                                xmlAttachments += string.Format(XmlPageFile, tempfilepath, preferredName);
+                                            }
                                         }
-                                        else
-                                            xmlAttachments +=
-                                                $"<one:InsertedFile pathSource=\"{tempfilepath}\" preferredName=\"{attachment.Hash}\" />";
                                     }
                                 }
                             }
@@ -650,6 +682,27 @@ namespace Evernote2Onenote
                             emailBody = _rxCdataInner.Replace(emailBody, "&lt;![CDATA[${text}]]&gt;");
                             emailBody = emailBody.Replace("‘", "'");
 
+                            // Split the body at the attachment tokens and interleave the
+                            // InsertedFile elements, so the page keeps the original order of
+                            // text and attachments.
+                            var outlineBlocks = new StringBuilder();
+                            var rxToken = new Regex(Regex.Escape(AttachTokenPrefix) + @"(\d+)" + Regex.Escape(AttachTokenSuffix));
+                            var chunkStart = 0;
+                            foreach (Match tokenMatch in rxToken.Matches(emailBody))
+                            {
+                                var chunk = emailBody.Substring(chunkStart, tokenMatch.Index - chunkStart);
+                                if (chunk.Trim().Length > 0)
+                                    outlineBlocks.Append(string.Format(XmlHtmlBlock, chunk));
+                                if (int.TryParse(tokenMatch.Groups[1].Value, out var fileIndex)
+                                    && fileIndex >= 0 && fileIndex < inlineFiles.Count)
+                                    outlineBlocks.Append(inlineFiles[fileIndex]);
+                                chunkStart = tokenMatch.Index + tokenMatch.Length;
+                            }
+                            var lastChunk = emailBody.Substring(chunkStart);
+                            if (lastChunk.Trim().Length > 0 || outlineBlocks.Length == 0)
+                                outlineBlocks.Append(string.Format(XmlHtmlBlock, lastChunk));
+                            var outlineBody = outlineBlocks.ToString();
+
                             try
                             {
                                 var pageId = string.Empty;
@@ -675,7 +728,7 @@ namespace Evernote2Onenote
                                         var outlineId = new Random().Next();
                                         //string outlineContent = string.Format(m_xmlNewOutlineContent, emailBody, outlineID, m_outlineIDMetaName);
                                         var xmlSource = string.Format(XmlSourceUrl, note.SourceUrl);
-                                        var outlineContent = string.Format(_xmlNewOutlineContent, emailBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
+                                        var outlineContent = string.Format(_xmlNewOutlineContent, outlineBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
                                         var xml = string.Format(XmlNewOutline, outlineContent, pageId, Xmlns, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), xmlAttachments, note.Date.ToString("yyyy'-'MM'-'ddTHH':'mm':'ss'Z'"));
                                         _onApp.UpdatePageContent(xml, DateTime.MinValue, OneNote.XMLSchema.xs2013, true);
                                     }
@@ -695,7 +748,7 @@ namespace Evernote2Onenote
                                     var outlineId = new Random().Next();
                                     //string outlineContent = string.Format(m_xmlNewOutlineContent, emailBody, outlineID, m_outlineIDMetaName);
                                     var xmlSource = string.Format(XmlSourceUrl, note.SourceUrl);
-                                    var outlineContent = string.Format(_xmlNewOutlineContent, emailBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
+                                    var outlineContent = string.Format(_xmlNewOutlineContent, outlineBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
                                     var xml = string.Format(XmlNewOutline, outlineContent, pageId, Xmlns, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), xmlAttachments, note.Date.ToString("yyyy'-'MM'-'ddTHH':'mm':'ss'Z'"));
                                     _onApp.UpdatePageContent(xml, DateTime.MinValue, OneNote.XMLSchema.xs2013, true);
                                 }
