@@ -56,6 +56,21 @@ namespace Evernote2Onenote
         private const string AttachTokenPrefix = "@@E2OATTACH";
         private const string AttachTokenSuffix = "@@";
 
+        // Evernote checkboxes (<en-todo/>) and horizontal rules (<hr/>) are dropped by
+        // OneNote. Set these to false to get that behaviour back.
+        private const bool ConvertTodoToText = true;
+        private const bool ConvertRuleToText = true;
+
+        // Characters used for the conversion. Change these if your font shows boxes.
+        private const string TodoCheckedText = "\u2611 ";      // BALLOT BOX WITH CHECK
+        private const string TodoUncheckedText = "\u2610 ";    // BALLOT BOX
+        private const string RuleText = "────────────────────────────────────────";
+
+        private static readonly Regex _rxTodoChecked = new Regex(@"<en-todo\b[^>]*?checked\s*=\s*[""']?true[""']?[^>]*?(?:/>|>\s*</en-todo>)", RegexOptions.IgnoreCase);
+        private static readonly Regex _rxTodoUnchecked = new Regex(@"<en-todo\b[^>]*?checked\s*=\s*[""']?false[""']?[^>]*?(?:/>|>\s*</en-todo>)", RegexOptions.IgnoreCase);
+        private static readonly Regex _rxTodoAny = new Regex(@"<en-todo\b[^>]*?(?:/>|>\s*</en-todo>)", RegexOptions.IgnoreCase);
+        private static readonly Regex _rxRule = new Regex(@"<hr\b[^>]*?(?:/>|>(?:\s*</hr>)?)", RegexOptions.IgnoreCase);
+
         private const string XmlSourceUrl = "<one:OE alignment=\"left\" quickStyleIndex=\"2\"><one:T><![CDATA[From &lt;<a href=\"{0}\">{0}</a>&gt; ]]></one:T></one:OE>";
 
         private const string XmlNewOutline = "<?xml version=\"1.0\"?>" + "<one:Page xmlns:one=\"{2}\" ID=\"{1}\" dateTime=\"{5}\">" + "<one:Title selected=\"partial\" lang=\"en-US\">" + "<one:OE creationTime=\"{5}\" lastModifiedTime=\"{5}\">" + "<one:T><![CDATA[{3}]]></one:T> " + "</one:OE>" + "</one:Title>{4}" + "<one:Outline>{0}</one:Outline></one:Page>";
@@ -676,6 +691,21 @@ namespace Evernote2Onenote
                                 htmlBody = rxPre.Replace(htmlBody, fullPreSection);
                             }
                             var emailBody = htmlBody;
+
+                            // OneNote drops markup it does not know, so evernote checkboxes
+                            // (<en-todo/>) and horizontal rules (<hr/>) disappear completely.
+                            // OneNote has no horizontal rule of its own either, so both are
+                            // converted to characters that survive the html block.
+                            if (ConvertTodoToText)
+                            {
+                                emailBody = _rxTodoChecked.Replace(emailBody, TodoCheckedText);
+                                emailBody = _rxTodoUnchecked.Replace(emailBody, TodoUncheckedText);
+                                // anything left over has no checked attribute at all
+                                emailBody = _rxTodoAny.Replace(emailBody, TodoUncheckedText);
+                            }
+                            if (ConvertRuleToText)
+                                emailBody = _rxRule.Replace(emailBody, "<div>" + RuleText + "</div>");
+
                             emailBody = _rxDate.Replace(emailBody, "Date: " + note.Date.ToString("ddd, dd MMM yyyy HH:mm:ss K"));
                             emailBody = emailBody.Replace("&apos;", "'");
                             emailBody = emailBody.Replace("’", "'");
