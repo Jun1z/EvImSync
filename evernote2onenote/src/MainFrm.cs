@@ -71,9 +71,33 @@ namespace Evernote2Onenote
         private static readonly Regex _rxTodoAny = new Regex(@"<en-todo\b[^>]*?(?:/>|>\s*</en-todo>)", RegexOptions.IgnoreCase);
         private static readonly Regex _rxRule = new Regex(@"<hr\b[^>]*?(?:/>|>(?:\s*</hr>)?)", RegexOptions.IgnoreCase);
 
+        // --- Evernote tag handling -------------------------------------------
+        // Original behaviour created one page per tag, so a note with three tags
+        // was imported three times. TagSectionMode changes that.
+        //   0 = every note goes into "not specified" (no duplicates)
+        //   1 = the FIRST tag becomes the section name (no duplicates)
+        //   2 = original behaviour: one page per tag (duplicates!)
+        private const int TagSectionMode = 0;
+
+        // Write the tag names as a text line at the END of the page. Reliable and
+        // found by normal OneNote text search. Notes without tags get no line.
+        // Result looks like:  【タグ：小谷、タグ：後藤、タグ：水垣】
+        private const bool WriteTagsAsText = true;
+        private const string TagLineOpen = "【";
+        private const string TagLineClose = "】";
+        private const string TagItemPrefix = "タグ：";
+        private const string TagItemSeparator = "、";
+        private const string TagLineStyle = "color:#7a5ea8;font-size:9pt;";
+
+        // EXPERIMENTAL: also create real OneNote tags (one:TagDef/one:Tag) on the
+        // page title, so the notes show up in the "Find Tags" pane. The exact
+        // schema for custom tags is not documented for the COM API, so if pages
+        // start failing to import, set this back to false.
+        private const bool CreateOneNoteTags = false;
+
         private const string XmlSourceUrl = "<one:OE alignment=\"left\" quickStyleIndex=\"2\"><one:T><![CDATA[From &lt;<a href=\"{0}\">{0}</a>&gt; ]]></one:T></one:OE>";
 
-        private const string XmlNewOutline = "<?xml version=\"1.0\"?>" + "<one:Page xmlns:one=\"{2}\" ID=\"{1}\" dateTime=\"{5}\">" + "<one:Title selected=\"partial\" lang=\"en-US\">" + "<one:OE creationTime=\"{5}\" lastModifiedTime=\"{5}\">" + "<one:T><![CDATA[{3}]]></one:T> " + "</one:OE>" + "</one:Title>{4}" + "<one:Outline>{0}</one:Outline></one:Page>";
+        private const string XmlNewOutline = "<?xml version=\"1.0\"?>" + "<one:Page xmlns:one=\"{2}\" ID=\"{1}\" dateTime=\"{5}\">" + "{6}" + "<one:Title selected=\"partial\" lang=\"en-US\">" + "<one:OE creationTime=\"{5}\" lastModifiedTime=\"{5}\">" + "{7}" + "<one:T><![CDATA[{3}]]></one:T> " + "</one:OE>" + "</one:Title>{4}" + "<one:Outline>{0}</one:Outline></one:Page>";
 
         private const string Xmlns = "http://schemas.microsoft.com/office/onenote/2013/onenote";
         private string _enNotebookName = "";
@@ -140,6 +164,13 @@ namespace Evernote2Onenote
             Close();
         }
 
+
+        private static string HtmlEscape(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+            return text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+        }
 
         private void SetInfo(string line1, string line2, int pos, int max)
         {
@@ -737,49 +768,68 @@ namespace Evernote2Onenote
                             {
                                 var pageId = string.Empty;
 
-                                // Get the hierarchy for all the notebooks
-                                if ((note.Tags.Count > 0) && (!_useUnfiledSection))
+                                // Work out which sections this note goes into. Only mode 2
+                                // (the original behaviour) creates one page per tag, which is
+                                // what made multi-tag notes get imported several times.
+                                var targetSections = new List<string>();
+                                if (!_useUnfiledSection && note.Tags.Count > 0 && TagSectionMode == 2)
+                                    targetSections.AddRange(note.Tags);
+                                else if (!_useUnfiledSection && note.Tags.Count > 0 && TagSectionMode == 1)
+                                    targetSections.Add(note.Tags[0]);
+                                else
+                                    targetSections.Add(null);   // null -> unfiled / "not specified"
+
+                                // Tags as a text line at the end of the page.
+                                var bodyWithTags = outlineBody;
+                                if (WriteTagsAsText && note.Tags.Count > 0)
                                 {
+                                    var items = new List<string>();
                                     foreach (var tag in note.Tags)
+                                        items.Add(HtmlEscape(TagItemPrefix) + HtmlEscape(tag));
+                                    var line = HtmlEscape(TagLineOpen)
+                                             + string.Join(HtmlEscape(TagItemSeparator), items.ToArray())
+                                             + HtmlEscape(TagLineClose);
+                                    if (!string.IsNullOrEmpty(TagLineStyle))
+                                        line = "<span style=\"" + TagLineStyle + "\">" + line + "</span>";
+                                    bodyWithTags = outlineBody + string.Format(XmlHtmlBlock, "<div>" + line + "</div>");
+                                }
+
+                                // Optional real OneNote tags on the page title.
+                                var xmlTagDefs = string.Empty;
+                                var xmlTags = string.Empty;
+                                if (CreateOneNoteTags && note.Tags.Count > 0)
+                                {
+                                    for (var i = 0; i < note.Tags.Count; i++)
                                     {
-                                        var sectionId = GetSection(tag);
-                                        try
-                                        {
-                                            _onApp.CreateNewPage(sectionId, out pageId, OneNote.NewPageStyle.npsBlankPageWithTitle);
-                                        }
-                                        catch (Exception)
-                                        {
-                                            sectionId = _useUnfiledSection ? _newnbId : GetSection("not specified");
-                                            _onApp.CreateNewPage(sectionId, out pageId, OneNote.NewPageStyle.npsBlankPageWithTitle);
-                                        }
-                                        //_onApp.GetPageContent(pageId, out _);
-                                        //OneNote uses HTML for the xml string to pass to the UpdatePageContent, so use the
-                                        //Outlook HTMLBody property.  It coerces rtf and plain text to HTML.
-                                        var outlineId = new Random().Next();
-                                        //string outlineContent = string.Format(m_xmlNewOutlineContent, emailBody, outlineID, m_outlineIDMetaName);
-                                        var xmlSource = string.Format(XmlSourceUrl, note.SourceUrl);
-                                        var outlineContent = string.Format(_xmlNewOutlineContent, outlineBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
-                                        var xml = string.Format(XmlNewOutline, outlineContent, pageId, Xmlns, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), xmlAttachments, note.Date.ToString("yyyy'-'MM'-'ddTHH':'mm':'ss'Z'"));
-                                        _onApp.UpdatePageContent(xml, DateTime.MinValue, OneNote.XMLSchema.xs2013, true);
+                                        xmlTagDefs += string.Format(
+                                            "<one:TagDef index=\"{0}\" type=\"0\" symbol=\"0\" name=\"{1}\" />",
+                                            i, System.Security.SecurityElement.Escape(note.Tags[i]).Replace("&apos;", "'"));
+                                        xmlTags += string.Format("<one:Tag index=\"{0}\" completed=\"true\" />", i);
                                     }
                                 }
-                                else
+
+                                foreach (var sectionName in targetSections)
                                 {
-                                    var sectionId = _useUnfiledSection ? _newnbId : GetSection("not specified");
-                                    _onApp.CreateNewPage(sectionId, out pageId, OneNote.NewPageStyle.npsBlankPageWithTitle);
-                                    //string pages = string.Empty;
-                                    //_onApp.GetHierarchy(sectionId, OneNote.HierarchyScope.hsPages, out pages);
-                                    //string pageContent = string.Empty;
-                                    //string testPageId = pageId;
-                                    //_onApp.GetPageContent(testPageId, out pageContent);
+                                    var sectionId = sectionName == null
+                                        ? (_useUnfiledSection ? _newnbId : GetSection("not specified"))
+                                        : GetSection(sectionName);
+                                    try
+                                    {
+                                        _onApp.CreateNewPage(sectionId, out pageId, OneNote.NewPageStyle.npsBlankPageWithTitle);
+                                    }
+                                    catch (Exception)
+                                    {
+                                        sectionId = _useUnfiledSection ? _newnbId : GetSection("not specified");
+                                        _onApp.CreateNewPage(sectionId, out pageId, OneNote.NewPageStyle.npsBlankPageWithTitle);
+                                    }
 
                                     //OneNote uses HTML for the xml string to pass to the UpdatePageContent, so use the
                                     //Outlook HTMLBody property.  It coerces rtf and plain text to HTML.
                                     var outlineId = new Random().Next();
-                                    //string outlineContent = string.Format(m_xmlNewOutlineContent, emailBody, outlineID, m_outlineIDMetaName);
                                     var xmlSource = string.Format(XmlSourceUrl, note.SourceUrl);
-                                    var outlineContent = string.Format(_xmlNewOutlineContent, outlineBody, outlineId, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), note.SourceUrl.Length > 0 ? xmlSource : "");
-                                    var xml = string.Format(XmlNewOutline, outlineContent, pageId, Xmlns, System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'"), xmlAttachments, note.Date.ToString("yyyy'-'MM'-'ddTHH':'mm':'ss'Z'"));
+                                    var escapedTitle = System.Security.SecurityElement.Escape(note.Title).Replace("&apos;", "'");
+                                    var outlineContent = string.Format(_xmlNewOutlineContent, bodyWithTags, outlineId, escapedTitle, note.SourceUrl.Length > 0 ? xmlSource : "");
+                                    var xml = string.Format(XmlNewOutline, outlineContent, pageId, Xmlns, escapedTitle, xmlAttachments, note.Date.ToString("yyyy'-'MM'-'ddTHH':'mm':'ss'Z'"), xmlTagDefs, xmlTags);
                                     _onApp.UpdatePageContent(xml, DateTime.MinValue, OneNote.XMLSchema.xs2013, true);
                                 }
                                 _onApp.SyncHierarchy(pageId);
